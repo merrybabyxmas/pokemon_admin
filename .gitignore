@@ -1,0 +1,5 @@
+data/pokemon.db
+data/my_team.json
+__pycache__/
+*.pyc
+venv/
