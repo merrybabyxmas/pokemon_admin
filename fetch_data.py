@@ -72,6 +72,15 @@ FORM_SUFFIX_KO = {
 def create_db():
     conn = sqlite3.connect(DB_PATH)
     c = conn.cursor()
+
+    # 기존 DB가 이전 스키마(species_id 컬럼 없음)이면 테이블 삭제 후 재생성
+    try:
+        c.execute("SELECT species_id FROM pokemon LIMIT 1")
+    except sqlite3.OperationalError:
+        print("  기존 DB 스키마가 오래되어 pokemon 테이블을 재생성합니다...")
+        c.execute("DROP TABLE IF EXISTS pokemon")
+        conn.commit()
+
     c.executescript("""
         CREATE TABLE IF NOT EXISTS types (
             id INTEGER PRIMARY KEY,
