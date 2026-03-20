@@ -9,8 +9,14 @@ import os
 import platform
 import sqlite3
 
-import rubymarshal.classes
-import rubymarshal.reader
+try:
+    import rubymarshal.classes
+    import rubymarshal.reader
+    HAS_RUBYMARSHAL = True
+except ImportError:
+    HAS_RUBYMARSHAL = False
+
+import marshal_reader
 
 DB_PATH = os.path.join(os.path.dirname(__file__), "data", "pokemon.db")
 
@@ -19,14 +25,20 @@ MOVE_CATEGORY = {0: "물리", 1: "특수", 2: "변화"}
 
 
 def _sym(name):
-    return rubymarshal.classes.Symbol(name)
+    """Symbol 생성 (rubymarshal 또는 커스텀)"""
+    if HAS_RUBYMARSHAL:
+        return rubymarshal.classes.Symbol(name)
+    return marshal_reader.RubySymbol(name)
 
 
 def _sym_str(sym):
     """Symbol 객체를 문자열로 변환"""
-    if isinstance(sym, rubymarshal.classes.Symbol):
+    if HAS_RUBYMARSHAL and isinstance(sym, rubymarshal.classes.Symbol):
         return str(sym).lstrip(":")
-    return str(sym)
+    if isinstance(sym, marshal_reader.RubySymbol):
+        return sym.name
+    s = str(sym)
+    return s.lstrip(":")
 
 
 def _to_str(val):
@@ -36,6 +48,18 @@ def _to_str(val):
     if isinstance(val, bytes):
         return val.decode("utf-8", errors="replace")
     return str(val)
+
+
+def _obj_get(obj, key):
+    """RubyObject에서 속성 읽기 (양쪽 파서 호환)"""
+    if isinstance(obj, marshal_reader.RubyObject):
+        # 커스텀 파서: 키가 "@name" 형식
+        return obj.attributes.get(f"@{key}") or obj.attributes.get(key)
+    if HAS_RUBYMARSHAL and hasattr(obj, "attributes"):
+        return obj.attributes.get(f"@{key}") or obj.attributes.get(key)
+    if isinstance(obj, dict):
+        return obj.get(key) or obj.get(f"@{key}")
+    return None
 
 
 def find_game_data_dir():
@@ -101,10 +125,16 @@ def find_save_file():
     return None
 
 
-def load_ruby_marshal(filepath):
-    """Ruby Marshal 파일 로드"""
-    with open(filepath, "rb") as f:
-        return rubymarshal.reader.load(f)
+def load_ruby_marshal(filepath, use_custom=False):
+    """Ruby Marshal 파일 로드. use_custom=True면 커스텀 파서 사용 (세이브 파일용)."""
+    if use_custom or not HAS_RUBYMARSHAL:
+        return marshal_reader.load(filepath)
+    try:
+        with open(filepath, "rb") as f:
+            return rubymarshal.reader.load(f)
+    except Exception:
+        # rubymarshal 실패 시 커스텀 파서로 폴백
+        return marshal_reader.load(filepath)
 
 
 # ─── 게임 데이터 임포트 (species.dat, types.dat, moves.dat → SQLite) ───
@@ -448,75 +478,88 @@ def read_save_party(save_path):
         list of dict: 파티 포켓몬 정보
         [{"species": "GARCHOMP", "form": 0, "level": 75, "moves": [...], ...}, ...]
     """
-    save_data = load_ruby_marshal(save_path)
+    # 세이브 파일은 커스텀 파서 사용 (순환 참조 문제 회피)
+    save_data = load_ruby_marshal(save_path, use_custom=True)
 
     # 세이브 데이터는 Hash: {:player => Player, :bag => ..., ...}
-    player = save_data.get(_sym("player"))
+    # 커스텀 파서에서는 키가 문자열 "player"
+    player = None
+    if isinstance(save_data, dict):
+        player = save_data.get("player")
+    if player is None and hasattr(save_data, 'get'):
+        player = save_data.get(_sym("player"))
     if player is None:
         raise ValueError("세이브 파일에서 플레이어 데이터를 찾을 수 없습니다.")
 
-    player_attrs = player.attributes
-    party = player_attrs.get("@party", [])
-    player_name = player_attrs.get("@name", "???")
+    # 속성 접근 (양쪽 파서 호환)
+    def _get_attr(obj, key):
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            return obj.get(key) or obj.get(f"@{key}")
+        if hasattr(obj, "attributes"):
+            return obj.attributes.get(f"@{key}") or obj.attributes.get(key)
+        return None
+
+    party = _get_attr(player, "party") or []
+    player_name = _to_str(_get_attr(player, "name")) or "???"
 
     result = []
     for poke in party:
         if poke is None:
             continue
-        a = poke.attributes
 
-        species_sym = _sym_str(a.get("@species", "???"))
-        form = a.get("@forced_form") or a.get("@form", 0) or 0
+        species_raw = _get_attr(poke, "species")
+        species_sym = _sym_str(species_raw) if species_raw else "???"
+        form = _get_attr(poke, "forced_form") or _get_attr(poke, "form") or 0
 
-        # 게임 키 결정 (SPECIES 또는 SPECIES_N)
-        if form > 0:
+        # 게임 키 결정
+        if form and form > 0:
             game_key = f"{species_sym}_{form}"
         else:
             game_key = species_sym
 
         # 기술 목록
-        moves_raw = a.get("@moves", [])
+        moves_raw = _get_attr(poke, "moves") or []
         moves = []
         for m in moves_raw:
             if m is None:
                 continue
-            m_attrs = m.attributes
-            move_id = m_attrs.get("@id")
+            move_id = _get_attr(m, "id")
             if move_id:
                 moves.append(_sym_str(move_id))
 
         # 레벨
-        level = a.get("@level", 0)
-        if level == 0:
-            # exp에서 레벨 계산이 필요할 수 있지만, 대부분 @level이 있음
-            level = a.get("@level", 50)
+        level = _get_attr(poke, "level") or 50
 
         # 능력
-        ability = a.get("@ability")
+        ability = _get_attr(poke, "ability")
         ability_str = _sym_str(ability) if ability else None
 
         # 지닌 물건
-        item = a.get("@item")
+        item = _get_attr(poke, "item")
         item_str = _sym_str(item) if item else None
 
         # 성격
-        nature = a.get("@nature")
+        nature = _get_attr(poke, "nature")
         nature_str = _sym_str(nature) if nature else None
 
         # HP
-        hp = a.get("@hp", 0)
-        totalhp = a.get("@totalhp", 0)
+        hp = _get_attr(poke, "hp") or 0
+        totalhp = _get_attr(poke, "totalhp") or 0
 
         # 개체값/노력치
         iv = {}
         ev = {}
-        raw_iv = a.get("@iv", {})
-        raw_ev = a.get("@ev", {})
-        for stat_sym in [_sym("HP"), _sym("ATTACK"), _sym("DEFENSE"),
-                         _sym("SPECIAL_ATTACK"), _sym("SPECIAL_DEFENSE"), _sym("SPEED")]:
-            stat_name = _sym_str(stat_sym)
-            iv[stat_name] = raw_iv.get(stat_sym, 0)
-            ev[stat_name] = raw_ev.get(stat_sym, 0)
+        raw_iv = _get_attr(poke, "iv") or {}
+        raw_ev = _get_attr(poke, "ev") or {}
+        stat_names = ["HP", "ATTACK", "DEFENSE", "SPECIAL_ATTACK", "SPECIAL_DEFENSE", "SPEED"]
+        for stat_name in stat_names:
+            # dict 키가 Symbol일 수도, 문자열일 수도 있음
+            iv_val = raw_iv.get(stat_name, 0) if isinstance(raw_iv, dict) else 0
+            ev_val = raw_ev.get(stat_name, 0) if isinstance(raw_ev, dict) else 0
+            iv[stat_name] = iv_val
+            ev[stat_name] = ev_val
 
         result.append({
             "species": species_sym,
