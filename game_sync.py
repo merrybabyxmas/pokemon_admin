@@ -595,19 +595,38 @@ def sync_party_to_team(save_path, db_path=None):
     team_ids = []
     matched = []
 
-    for poke in party:
-        # game_key로 DB에서 포켓몬 찾기
-        row = conn.execute(
-            "SELECT id, display_name, game_key FROM pokemon WHERE game_key = ?",
-            (poke["game_key"],),
-        ).fetchone()
+    # DB 스키마 감지 (game_key 유무)
+    cols = [r[1] for r in conn.execute("PRAGMA table_info(pokemon)").fetchall()]
+    has_game_key = "game_key" in cols
 
-        if not row:
-            # 폼 없이 기본 종으로 재시도
+    for poke in party:
+        row = None
+
+        if has_game_key:
+            # 게임 데이터 DB: game_key로 검색
             row = conn.execute(
-                "SELECT id, display_name, game_key FROM pokemon WHERE game_key = ?",
-                (poke["species"],),
+                "SELECT id, display_name FROM pokemon WHERE game_key = ?",
+                (poke["game_key"],),
             ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT id, display_name FROM pokemon WHERE game_key = ?",
+                    (poke["species"],),
+                ).fetchone()
+        else:
+            # PokéAPI DB: name_en으로 검색 (species를 소문자로 변환)
+            species_lower = poke["species"].lower()
+            if poke.get("form") and poke["form"] > 0:
+                search_name = f"{species_lower}-{poke['form']}"
+                row = conn.execute(
+                    "SELECT id, display_name FROM pokemon WHERE name_en = ?",
+                    (search_name,),
+                ).fetchone()
+            if not row:
+                row = conn.execute(
+                    "SELECT id, display_name FROM pokemon WHERE LOWER(name_en) = ?",
+                    (species_lower,),
+                ).fetchone()
 
         if row:
             team_ids.append(row[0])
