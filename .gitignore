@@ -1,5 +1,6 @@
 data/pokemon.db
 data/my_team.json
+data/paths.json
 __pycache__/
 *.pyc
 venv/

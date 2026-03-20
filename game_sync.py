@@ -62,34 +62,199 @@ def _obj_get(obj, key):
     return None
 
 
+PATHS_CACHE = os.path.join(os.path.dirname(__file__), "data", "paths.json")
+
+
+def _load_cached_paths():
+    """이전에 찾은 경로 캐시 로드"""
+    if os.path.exists(PATHS_CACHE):
+        import json
+        with open(PATHS_CACHE, "r", encoding="utf-8") as f:
+            return json.load(f)
+    return {}
+
+
+def _save_cached_paths(paths):
+    """찾은 경로를 캐시에 저장"""
+    import json
+    os.makedirs(os.path.dirname(PATHS_CACHE), exist_ok=True)
+    with open(PATHS_CACHE, "w", encoding="utf-8") as f:
+        json.dump(paths, f, ensure_ascii=False, indent=2)
+
+
+def deep_scan_pc(callback=None):
+    """
+    PC 전체를 스캔하여 게임 Data 폴더와 세이브 파일을 찾습니다.
+    callback(msg): 진행 상황을 알리는 콜백 (UI용)
+
+    Returns:
+        {"game_data_dirs": [...], "save_files": [...]}
+    """
+    results = {"game_data_dirs": [], "save_files": []}
+    system = platform.system()
+
+    # 스캔할 루트 경로들
+    scan_roots = []
+
+    if system == "Windows":
+        # 모든 드라이브 탐색
+        import string
+        for letter in string.ascii_uppercase:
+            drive = f"{letter}:\\"
+            if os.path.exists(drive):
+                scan_roots.append(drive)
+        # AppData는 반드시 포함
+        appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+        if appdata:
+            scan_roots.insert(0, appdata)
+        if localappdata:
+            scan_roots.insert(0, localappdata)
+    else:
+        home = os.path.expanduser("~")
+        scan_roots = [home, "/tmp"]
+        # 리눅스에서 마운트된 드라이브도 확인
+        if os.path.exists("/mnt"):
+            scan_roots.append("/mnt")
+        if os.path.exists("/media"):
+            scan_roots.append("/media")
+
+    # 건너뛸 디렉토리 (속도 최적화)
+    skip_dirs = {
+        "Windows", "System32", "SysWOW64", "$Recycle.Bin", "node_modules",
+        ".git", "__pycache__", "venv", ".venv", "site-packages",
+        "ProgramData", "Recovery", "Boot",
+    }
+
+    scanned = 0
+    for root_path in scan_roots:
+        if callback:
+            callback(f"스캔 중: {root_path}")
+
+        try:
+            for dirpath, dirnames, filenames in os.walk(root_path, topdown=True):
+                # 건너뛸 디렉토리 필터링
+                dirnames[:] = [
+                    d for d in dirnames
+                    if d not in skip_dirs
+                    and not d.startswith(".")
+                    and not d.startswith("$")
+                ]
+
+                scanned += 1
+                if scanned % 500 == 0 and callback:
+                    callback(f"스캔 중... ({scanned}개 폴더 확인) - {dirpath[:60]}")
+
+                # 1. species.dat가 있으면 게임 Data 폴더
+                if "species.dat" in filenames and "types.dat" in filenames:
+                    results["game_data_dirs"].append(dirpath)
+                    if callback:
+                        callback(f"게임 데이터 발견: {dirpath}")
+
+                # 2. Game.rxdata 세이브 파일
+                for fname in filenames:
+                    if fname.lower().startswith("game") and fname.lower().endswith(".rxdata"):
+                        # Map이나 다른 rxdata와 구분: Game.rxdata, Game_1.rxdata 등
+                        if fname.lower().replace("_", "").replace(" ", "").startswith("game"):
+                            full = os.path.join(dirpath, fname)
+                            # 용량 체크: 세이브 파일은 보통 100KB 이상
+                            try:
+                                if os.path.getsize(full) > 50000:
+                                    results["save_files"].append(full)
+                                    if callback:
+                                        callback(f"세이브 파일 발견: {full}")
+                            except OSError:
+                                pass
+
+        except PermissionError:
+            continue
+        except Exception:
+            continue
+
+    if callback:
+        callback(
+            f"스캔 완료! 게임 데이터: {len(results['game_data_dirs'])}개, "
+            f"세이브 파일: {len(results['save_files'])}개"
+        )
+
+    # 결과 캐싱
+    cache = _load_cached_paths()
+    if results["game_data_dirs"]:
+        cache["game_data_dir"] = results["game_data_dirs"][0]
+    if results["save_files"]:
+        cache["save_file"] = results["save_files"][0]
+    _save_cached_paths(cache)
+
+    return results
+
+
 def find_game_data_dir():
-    """게임 Data 폴더 자동 탐색. 여러 경로를 시도합니다."""
+    """게임 Data 폴더 자동 탐색. 캐시 → 빠른 탐색 → None 순서."""
+    # 1. 캐시 확인
+    cache = _load_cached_paths()
+    cached = cache.get("game_data_dir")
+    if cached and os.path.isdir(cached) and os.path.exists(os.path.join(cached, "species.dat")):
+        return cached
+
+    # 2. 빠른 후보 탐색
     candidates = []
 
-    # 1. 환경변수로 지정된 경로
     env_path = os.environ.get("POKEMON_GAME_DIR")
     if env_path:
         candidates.append(os.path.join(env_path, "Data"))
 
-    # 2. 현재 프로젝트 내 extracted 폴더
     project_root = os.path.dirname(__file__)
     raw_dir = os.path.join(os.path.dirname(project_root), "pokemon_raw", "extracted")
     if os.path.exists(raw_dir):
         for name in os.listdir(raw_dir):
             candidates.append(os.path.join(raw_dir, name, "Data"))
 
-    # 3. 직접 지정 경로 (필요시 수정)
     candidates.append(os.path.join(project_root, "game_data", "Data"))
+
+    # Windows 흔한 위치들
+    if platform.system() == "Windows":
+        home = os.path.expanduser("~")
+        for base in [
+            os.path.join(home, "Desktop"),
+            os.path.join(home, "Downloads"),
+            os.path.join(home, "Documents"),
+            "C:\\Games",
+            "D:\\Games",
+            "D:\\",
+            "E:\\",
+        ]:
+            if os.path.isdir(base):
+                try:
+                    for name in os.listdir(base):
+                        if "pokemon" in name.lower() or "another" in name.lower():
+                            candidates.append(os.path.join(base, name, "Data"))
+                            # 한 단계 더 깊이
+                            subpath = os.path.join(base, name)
+                            if os.path.isdir(subpath):
+                                for sub in os.listdir(subpath):
+                                    candidates.append(os.path.join(subpath, sub, "Data"))
+                except PermissionError:
+                    continue
 
     for path in candidates:
         if os.path.isdir(path) and os.path.exists(os.path.join(path, "species.dat")):
+            # 캐싱
+            cache["game_data_dir"] = path
+            _save_cached_paths(cache)
             return path
 
     return None
 
 
 def find_save_file():
-    """세이브 파일(Game.rxdata) 자동 탐색."""
+    """세이브 파일(Game.rxdata) 자동 탐색. 캐시 → 빠른 탐색 → None 순서."""
+    # 1. 캐시 확인
+    cache = _load_cached_paths()
+    cached = cache.get("save_file")
+    if cached and os.path.isfile(cached):
+        return cached
+
+    # 2. 빠른 후보 탐색
     candidates = []
 
     env_path = os.environ.get("POKEMON_SAVE_DIR")
@@ -99,28 +264,63 @@ def find_save_file():
     system = platform.system()
     if system == "Windows":
         appdata = os.environ.get("APPDATA", "")
+        localappdata = os.environ.get("LOCALAPPDATA", "")
+
+        # AppData 내 모든 Pokemon 관련 폴더
+        for base in [appdata, localappdata]:
+            if base and os.path.isdir(base):
+                try:
+                    for name in os.listdir(base):
+                        if "pokemon" in name.lower():
+                            folder = os.path.join(base, name)
+                            if os.path.isdir(folder):
+                                for f in os.listdir(folder):
+                                    if f.lower().startswith("game") and f.lower().endswith(".rxdata"):
+                                        candidates.append(os.path.join(folder, f))
+                except PermissionError:
+                    continue
+
+        # mkxp 기본 세이브 경로
         if appdata:
-            candidates.append(os.path.join(appdata, "Pokemon Another Red", "Game.rxdata"))
-            # 일반적인 다른 경로들
-            for name in os.listdir(appdata) if os.path.isdir(appdata) else []:
-                if "pokemon" in name.lower() and "another" in name.lower():
-                    candidates.append(os.path.join(appdata, name, "Game.rxdata"))
+            candidates.append(os.path.join(appdata, "mkxp", "Game.rxdata"))
+
     elif system == "Linux":
         home = os.path.expanduser("~")
         candidates.append(os.path.join(home, ".local", "share", "mkxp", "Game.rxdata"))
+        # 리눅스에서 AppData 마운트 확인
+        for mnt in ["/mnt", "/media"]:
+            if os.path.exists(mnt):
+                try:
+                    for user_dir in os.listdir(mnt):
+                        appdata_path = os.path.join(mnt, user_dir, "AppData", "Roaming")
+                        if os.path.isdir(appdata_path):
+                            for name in os.listdir(appdata_path):
+                                if "pokemon" in name.lower():
+                                    folder = os.path.join(appdata_path, name)
+                                    if os.path.isdir(folder):
+                                        for f in os.listdir(folder):
+                                            if f.lower().startswith("game") and f.lower().endswith(".rxdata"):
+                                                candidates.append(os.path.join(folder, f))
+                except (PermissionError, OSError):
+                    continue
 
-    # 게임 폴더 내 세이브
+    # 게임 폴더 근처에서도 찾기
     game_dir = find_game_data_dir()
     if game_dir:
         parent = os.path.dirname(game_dir)
-        candidates.append(os.path.join(parent, "Game.rxdata"))
-        # Auto Multi Save 플러그인 패턴
-        for i in range(1, 4):
-            candidates.append(os.path.join(parent, f"Game_{i}.rxdata"))
+        for f in os.listdir(parent) if os.path.isdir(parent) else []:
+            if f.lower().startswith("game") and f.lower().endswith(".rxdata"):
+                candidates.append(os.path.join(parent, f))
 
     for path in candidates:
         if os.path.isfile(path):
-            return path
+            try:
+                if os.path.getsize(path) > 50000:
+                    cache["save_file"] = path
+                    _save_cached_paths(cache)
+                    return path
+            except OSError:
+                continue
 
     return None
 

@@ -227,10 +227,23 @@ class PokemonCounterApp(QMainWindow):
         left.addWidget(lbl)
 
         # 세이브 동기화 버튼
-        sync_btn = QPushButton("세이브 파일에서 파티 불러오기")
+        sync_row = QHBoxLayout()
+        sync_btn = QPushButton("파티 불러오기")
         sync_btn.setObjectName("syncBtn")
         sync_btn.clicked.connect(self._sync_from_save)
-        left.addWidget(sync_btn)
+        scan_btn = QPushButton("PC 스캔")
+        scan_btn.setObjectName("syncBtn")
+        scan_btn.clicked.connect(self._deep_scan)
+        sync_row.addWidget(sync_btn, stretch=2)
+        sync_row.addWidget(scan_btn, stretch=1)
+        left.addLayout(sync_row)
+
+        # 연결 상태 표시
+        self.connection_label = QLabel("")
+        self.connection_label.setWordWrap(True)
+        self.connection_label.setStyleSheet("font-size: 11px; color: #888; padding: 2px;")
+        left.addWidget(self.connection_label)
+        self._update_connection_status()
 
         # 수동 추가용 검색창
         self.team_input = QLineEdit()
@@ -319,10 +332,103 @@ class PokemonCounterApp(QMainWindow):
 
         self._refresh_team_list()
 
+    # ─── 연결 상태 ───
+
+    def _update_connection_status(self):
+        """캐시된 경로 기반으로 연결 상태 표시"""
+        try:
+            from game_sync import _load_cached_paths
+            paths = _load_cached_paths()
+            parts = []
+            game_dir = paths.get("game_data_dir")
+            save_file = paths.get("save_file")
+            if game_dir and os.path.isdir(game_dir):
+                parts.append(f"게임: {os.path.basename(os.path.dirname(game_dir))}")
+            if save_file and os.path.isfile(save_file):
+                parts.append(f"세이브: {os.path.basename(save_file)}")
+            if parts:
+                self.connection_label.setText(" | ".join(parts))
+                self.connection_label.setStyleSheet("font-size: 11px; color: #4ecdc4; padding: 2px;")
+            else:
+                self.connection_label.setText("게임 미연결 - 'PC 스캔' 버튼으로 자동 탐색")
+                self.connection_label.setStyleSheet("font-size: 11px; color: #888; padding: 2px;")
+        except Exception:
+            self.connection_label.setText("")
+
+    # ─── PC 스캔 ───
+
+    def _deep_scan(self):
+        """PC 전체를 스캔하여 게임 데이터와 세이브 파일을 자동으로 찾기"""
+        try:
+            from game_sync import deep_scan_pc, import_game_data, _load_cached_paths
+        except ImportError:
+            QMessageBox.warning(self, "오류", "game_sync 모듈을 찾을 수 없습니다.")
+            return
+
+        reply = QMessageBox.question(
+            self, "PC 전체 스캔",
+            "PC 전체를 스캔하여 게임 파일과 세이브 파일을 자동으로 찾습니다.\n"
+            "시간이 좀 걸릴 수 있습니다. 진행하시겠습니까?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply != QMessageBox.StandardButton.Yes:
+            return
+
+        self.connection_label.setText("스캔 중...")
+        self.connection_label.setStyleSheet("font-size: 11px; color: #ffa502; padding: 2px;")
+        QApplication.processEvents()
+
+        def on_progress(msg):
+            self.connection_label.setText(msg)
+            QApplication.processEvents()
+
+        results = deep_scan_pc(callback=on_progress)
+
+        # 결과 표시
+        msg_parts = []
+        if results["game_data_dirs"]:
+            msg_parts.append("게임 데이터 폴더:")
+            for p in results["game_data_dirs"]:
+                msg_parts.append(f"  {p}")
+        else:
+            msg_parts.append("게임 데이터를 찾지 못했습니다.")
+
+        if results["save_files"]:
+            msg_parts.append("\n세이브 파일:")
+            for p in results["save_files"]:
+                msg_parts.append(f"  {p}")
+        else:
+            msg_parts.append("\n세이브 파일을 찾지 못했습니다.")
+
+        QMessageBox.information(self, "스캔 결과", "\n".join(msg_parts))
+
+        # 게임 데이터가 새로 발견됐으면 DB 임포트 제안
+        if results["game_data_dirs"]:
+            data_dir = results["game_data_dirs"][0]
+            reply = QMessageBox.question(
+                self, "게임 데이터 임포트",
+                f"발견된 게임 데이터를 DB에 임포트하시겠습니까?\n{data_dir}",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply == QMessageBox.StandardButton.Yes:
+                self.connection_label.setText("게임 데이터 임포트 중...")
+                QApplication.processEvents()
+                try:
+                    import_game_data(data_dir)
+                    # 포켓몬 이름 목록 다시 로드
+                    self.all_pokemon = get_all_pokemon_names()
+                    self.name_to_id = {p[1]: p[0] for p in self.all_pokemon}
+                    self.pokemon_names = [p[1] for p in self.all_pokemon]
+                    QMessageBox.information(self, "완료", "게임 데이터 임포트 완료!")
+                except Exception as e:
+                    QMessageBox.critical(self, "오류", f"임포트 실패:\n{e}")
+
+        self._update_connection_status()
+
     # ─── 세이브 동기화 ───
 
     def _sync_from_save(self):
-        """세이브 파일 선택 → 파티 자동 동기화"""
+        """세이브 파일 자동 탐색 → 없으면 파일 선택 → 파티 동기화"""
         try:
             from game_sync import find_save_file, sync_party_to_team
         except ImportError:
@@ -331,6 +437,15 @@ class PokemonCounterApp(QMainWindow):
 
         # 자동 탐색 시도
         save_path = find_save_file()
+
+        if save_path:
+            reply = QMessageBox.question(
+                self, "세이브 파일 발견",
+                f"자동으로 세이브 파일을 찾았습니다:\n{save_path}\n\n이 파일을 사용하시겠습니까?",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                save_path = None
 
         if not save_path:
             save_path, _ = QFileDialog.getOpenFileName(
