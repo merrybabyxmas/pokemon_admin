@@ -119,6 +119,22 @@ def deep_scan_pc(callback=None):
         if os.path.exists("/media"):
             scan_roots.append("/media")
 
+    # mkxp.json 기반 세이브 경로 우선 탐색 (게임 Data 이미 발견된 경우)
+    for data_dir in results.get("game_data_dirs", []):
+        mkxp_paths = _read_mkxp_data_path(data_dir)
+        for save_dir in mkxp_paths:
+            if os.path.isdir(save_dir):
+                try:
+                    for f in os.listdir(save_dir):
+                        if f.lower().endswith(".rxdata"):
+                            full = os.path.join(save_dir, f)
+                            if os.path.getsize(full) > 50000:
+                                results["save_files"].append(full)
+                                if callback:
+                                    callback(f"세이브 파일 발견 (mkxp.json): {full}")
+                except (PermissionError, OSError):
+                    pass
+
     # 건너뛸 디렉토리 (속도 최적화)
     skip_dirs = {
         "Windows", "System32", "SysWOW64", "$Recycle.Bin", "node_modules",
@@ -170,6 +186,25 @@ def deep_scan_pc(callback=None):
             continue
         except Exception:
             continue
+
+    # 세이브를 아직 못 찾았으면, 발견된 게임 데이터의 mkxp.json에서 경로 추출
+    if not results["save_files"] and results["game_data_dirs"]:
+        if callback:
+            callback("mkxp.json에서 세이브 경로 확인 중...")
+        for data_dir in results["game_data_dirs"]:
+            mkxp_paths = _read_mkxp_data_path(data_dir)
+            for save_dir in mkxp_paths:
+                if os.path.isdir(save_dir):
+                    try:
+                        for f in os.listdir(save_dir):
+                            if f.lower().endswith(".rxdata"):
+                                full = os.path.join(save_dir, f)
+                                if os.path.getsize(full) > 50000:
+                                    results["save_files"].append(full)
+                                    if callback:
+                                        callback(f"세이브 파일 발견 (AppData): {full}")
+                    except (PermissionError, OSError):
+                        pass
 
     if callback:
         callback(
@@ -246,8 +281,77 @@ def find_game_data_dir():
     return None
 
 
+def _read_mkxp_data_path(game_dir):
+    """게임 폴더의 mkxp.json에서 dataPathApp 값을 읽어 AppData 세이브 경로를 반환"""
+    if not game_dir:
+        return []
+    # game_dir은 Data 폴더이므로 부모가 게임 루트
+    game_root = os.path.dirname(game_dir)
+    mkxp_path = os.path.join(game_root, "mkxp.json")
+    if not os.path.isfile(mkxp_path):
+        return []
+
+    import json
+    paths = []
+    try:
+        with open(mkxp_path, "r", encoding="utf-8") as f:
+            # mkxp.json에 주석이 있을 수 있으므로 제거
+            content = ""
+            for line in f:
+                stripped = line.strip()
+                if stripped.startswith("//"):
+                    continue
+                content += line
+            config = json.loads(content)
+
+        app_name = config.get("dataPathApp", "")
+        org_name = config.get("dataPathOrg", "")
+
+        if app_name:
+            system = platform.system()
+            if system == "Windows":
+                appdata = os.environ.get("APPDATA", "")
+                localappdata = os.environ.get("LOCALAPPDATA", "")
+                for base in [appdata, localappdata]:
+                    if base:
+                        if org_name:
+                            paths.append(os.path.join(base, org_name, app_name))
+                        paths.append(os.path.join(base, app_name))
+            elif system == "Linux":
+                home = os.path.expanduser("~")
+                if org_name:
+                    paths.append(os.path.join(home, ".local", "share", org_name, app_name))
+                paths.append(os.path.join(home, ".local", "share", app_name))
+                paths.append(os.path.join(home, ".local", "share", "mkxp", app_name))
+    except (json.JSONDecodeError, OSError):
+        pass
+
+    # Game.ini의 Title도 시도
+    ini_path = os.path.join(game_root, "Game.ini")
+    if os.path.isfile(ini_path):
+        try:
+            with open(ini_path, "r", encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    if line.strip().lower().startswith("title="):
+                        title = line.strip().split("=", 1)[1].strip()
+                        if title:
+                            system = platform.system()
+                            if system == "Windows":
+                                appdata = os.environ.get("APPDATA", "")
+                                if appdata:
+                                    paths.append(os.path.join(appdata, title))
+                            elif system == "Linux":
+                                home = os.path.expanduser("~")
+                                paths.append(os.path.join(home, ".local", "share", title))
+                        break
+        except OSError:
+            pass
+
+    return paths
+
+
 def find_save_file():
-    """세이브 파일(Game.rxdata) 자동 탐색. 캐시 → 빠른 탐색 → None 순서."""
+    """세이브 파일(Game.rxdata) 자동 탐색. 캐시 → mkxp.json → 빠른 탐색 → None."""
     # 1. 캐시 확인
     cache = _load_cached_paths()
     cached = cache.get("save_file")
@@ -260,6 +364,18 @@ def find_save_file():
     env_path = os.environ.get("POKEMON_SAVE_DIR")
     if env_path:
         candidates.append(os.path.join(env_path, "Game.rxdata"))
+
+    # 3. mkxp.json에서 정확한 세이브 경로 읽기 (핵심!)
+    game_dir = find_game_data_dir()
+    mkxp_paths = _read_mkxp_data_path(game_dir)
+    for save_dir in mkxp_paths:
+        if os.path.isdir(save_dir):
+            try:
+                for f in os.listdir(save_dir):
+                    if f.lower().endswith(".rxdata"):
+                        candidates.append(os.path.join(save_dir, f))
+            except PermissionError:
+                pass
 
     system = platform.system()
     if system == "Windows":
