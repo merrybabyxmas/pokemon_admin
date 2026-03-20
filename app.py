@@ -337,7 +337,7 @@ class PokemonCounterApp(QMainWindow):
                 self,
                 "세이브 파일 선택",
                 "",
-                "Game Save (Game*.rxdata);;All Files (*)",
+                "세이브 파일 (*.rxdata *.dat);;All Files (*.*)",
             )
 
         if not save_path:
